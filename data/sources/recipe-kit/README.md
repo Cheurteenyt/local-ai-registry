@@ -3,7 +3,8 @@
 Measured runs made with the [recipe kit](https://github.com/sybil-solutions/local-ai-recipe-kit): one JSON per run
 (`schema: local-ai-recipe-kit/submission/v1`), built by the kit's `tools/make_submission.py` and checked by its
 `tools/validate.py`. Each file holds the probe of the machine, the exact launch (image pinned by digest, argv, env),
-the reference-panel quality result, the fixed-protocol speed sweep and the measured memory needs.
+the reference-panel quality result, the fixed-protocol speed sweep and, where `memwatch.sh` ran, the measured memory
+needs (`needs_measured`).
 
 These are supporting evidence. A file here is not a recipe and has not passed the registry's six lab gates; a recipe
 only exists once `lab/lab.py try` passes on the card.
@@ -11,7 +12,8 @@ only exists once `lab/lab.py try` passes on the card.
 ## Layout
 
 `<card id>/<YYYY-MM-DD>-<handle>[-<config>].json`. Add new files in the same pull request as the recipe they support,
-or on their own for a run that produced no recipe (a measured failure counts: say what did not work in `notes`).
+or on their own for a measured run that produced no recipe. `validate.py` needs the panel and the speed sweep, so a run
+that never got that far is reported on the bounty issue (or a new issue) with its `probe.py` output instead.
 
 ## Files
 
@@ -25,4 +27,7 @@ Moved unchanged from the kit's `submissions/` directory (kit commit `ef9782c`); 
 | `2x-r9700-32gb/2026-09-29-benstadin-m2.json` | qwen3.8-flash-next-offload | vLLM MXFP4, TP 2, profile M2, BF16 KV | 0.9700 | 0.01470 | 104.0 | 3826 | `ef883d2` (kit #1) |
 | `2x-r9700-32gb/2026-09-29-benstadin-m2-fp8.json` | qwen3.8-flash-next-offload | as above, FP8 KV | 0.9687 | 0.01502 | 121.0 | 4180 | `ef883d2` (kit #1) |
 
-Numbers are copied from the files (sweep medians). The registry has no 2x R9700 card or recipe yet.
+Numbers are copied from the files (sweep medians). The 3090 file has no `needs_measured`. It is independent history,
+not the proof of the current `rtx-3090-24gb/qwen3.8-flash-next.sglang.200k` recipe: it ran image
+`sglang-exl3-flashnext@sha256:95b1a85d…`, the recipe's launch pins `@sha256:ce47df25…`, and the recipe's proof is its
+own six-gate run. The registry has no 2x R9700 card or recipe yet.
