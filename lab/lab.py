@@ -25,6 +25,7 @@ import shlex
 import string
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -325,9 +326,30 @@ def stream_rate(endpoint, model, prompt, window=30.0):
     return (n / span if span else 0), total, time.monotonic() - t0
 
 
-def gates(endpoint, launch):
-    """Run every gate; returns (passed, proof, evidence)."""
-    ev, ok = {}, {}
+def gates(endpoint, launch, ev=None):
+    """Run every gate; returns (passed, proof, evidence). `ev` is filled as the gates run, so a gate that blows up
+    leaves the evidence of the gates that ran: a failed run is still evidence."""
+    ev, ok = {} if ev is None else ev, {}
+    try:
+        return run_gates(endpoint, launch, ev, ok)
+    except Exception as e:  # a gate blew up: it is a failed gate, not a lost run
+        failed = next((g for g in GATES if g not in ok), None)  # the gates run in order: the first that never answered blew up
+        log(f"the {failed or 'load'} gate failed: {e!r}")
+        if failed:
+            ok[failed] = False
+            ev[failed] = {"error": repr(e)}
+        else:
+            ev["error"] = repr(e)
+        passed = all(ok.get(g) for g in GATES)
+        proof = {"gates": " ".join(g for g in GATES if ok.get(g)), "tps": 0, "prefill": None, "served": None}
+        evidence = {"ok": ok, **ev}
+    finally:
+        ev["ok"] = ok
+    return passed, proof, evidence
+
+
+def run_gates(endpoint, launch, ev, ok):
+    """The gates themselves; `gates` keeps the evidence when one of them blows up."""
     models, _ = call(endpoint, "/v1/models", timeout=30)
     served = models["data"][0]["id"]
     ok["load"] = True
@@ -373,6 +395,8 @@ def gates(endpoint, launch):
         try:                  # minutes while the prompt is prefilled; the retried prompt answers from the server's
             c, u, secs = chat(endpoint, served, [{"role": "user", "content": prompt + "\n\nWhat is the access code for the vault? Reply with only the code."}])
             break             # prefix cache, so the retry costs seconds, and the gate is the same check
+        except urllib.error.HTTPError as e:  # the server answered: it refused the prompt, a retry would refuse it again
+            raise SystemExit(f"context gate: the server refused the prompt: {e.code} {e.reason}") from e
         except (OSError, http.client.HTTPException) as e:
             if isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError):
                 raise         # a timeout is the card being slow, not a dropped connection: fail the gate, never retry
@@ -457,6 +481,15 @@ def rented(recipe, launch, args):
                             vast_min_disk_bw=getattr(args, "min_disk_bw", None) or (1500 if needs.get("fast_storage") == "nvme" else 0),
                             vast_min_pcie=getattr(args, "min_pcie", 0) or 0, vast_max_inet_cost=getattr(args, "max_inet_cost", 0.02))
     provider = vr.PROVIDERS[args.on](ns)
+
+    def destroy(handle):
+        """Destroy the rented box. A failure is loud, never raised: the run's own error must not be masked, and a
+        box that keeps billing must be named so that it can be destroyed by hand."""
+        try:
+            provider.destroy(handle)
+        except BaseException as error:
+            log(f"ERROR: could not destroy the {args.on} instance {handle['id']}: {error} -- it is still billing: "
+                f"destroy it by hand")
     if getattr(args, "machine", None):  # compare.py: the machine the other engine just ran on
         every = provider.offers
         provider.offers = lambda spec, exclude: [o for o in every(spec, set()) if o.get("machine_id") == args.machine]
@@ -479,16 +512,19 @@ def rented(recipe, launch, args):
                     raise SystemExit(f"not ready within {getattr(args, 'ready_timeout', 5400)}s")
                 time.sleep(10)
             log(f"ready after {int(time.monotonic() - t0)}s at {handle['endpoint']}")
+
+            def cleanup():
+                save_logs(handle, recipe)
+                destroy(handle)
             return handle["endpoint"], {"on": args.on, "gpu": handle.get("gpu"), "host": handle.get("host"), "cost_h": handle.get("cost"),
-                                        "handle": handle, "provider": provider}, \
-                lambda: (save_logs(handle, recipe), provider.destroy(handle))
+                                        "handle": handle, "provider": provider}, cleanup
         except vr.StartStalled as stall:
             save_logs(handle, recipe)
-            provider.destroy(handle)
+            destroy(handle)
             log(f"attempt {attempt}: {stall}; trying another host")
         except BaseException:
             save_logs(handle, recipe)  # any other failure: keep the container's log, never leave the box running
-            provider.destroy(handle)
+            destroy(handle)
             raise
     raise SystemExit("no host started the container")
 
@@ -523,10 +559,14 @@ def cmd_try(args):
         endpoint, where = args.endpoint.rstrip("/"), {"on": "owner", "gpu": args.gpu}
     else:
         endpoint, where, stop = rented(recipe, launch, args)
+    evidence, failure = {}, None
     try:
-        passed, proof, evidence = gates(endpoint, launch)
-    finally:
-        stop()
+        passed, proof, evidence = gates(endpoint, launch, evidence)
+    except BaseException as e:  # the run could not go on: the record is written anyway, and the error is not masked
+        passed, proof = False, {"gates": "", "tps": 0, "prefill": None, "served": None}
+        evidence.setdefault("ok", {})
+        evidence["error"] = repr(e)
+        failure = e
     at = dt.datetime.now(dt.timezone.utc)
     proof = {"at": at.strftime("%Y-%m-%d"), "on": where["on"], "gpu": where.get("gpu"), "launch_sha256": launch_hash(launch), **proof}
     if args.proxy_gpu and args.on == "endpoint":
@@ -542,13 +582,18 @@ def cmd_try(args):
     elif args.proxy_gpu:
         proof["proxy"] = f"{args.proxy_gpu}, memory capped to the card"
     slug = f"{args.model}.{p['id']}.{launch['ctx'] // 1024}k"
-    RUNS.mkdir(parents=True, exist_ok=True)
-    run = {"recipe": recipe, "where": {k: v for k, v in where.items() if k not in ("handle", "provider")}, "passed": passed, "proof": proof, "evidence": evidence, "launch_config_sha256": (launch["config"] or {}).get("sha256")}
-    text = json.dumps(run, indent=1, ensure_ascii=False)
-    run_path = RUNS / f"{args.card}.{slug}.{at.strftime('%Y%m%dT%H%M%S')}.json"
-    run_path.write_text(text + "\n")
+    try:
+        RUNS.mkdir(parents=True, exist_ok=True)
+        run = {"recipe": recipe, "where": {k: v for k, v in where.items() if k not in ("handle", "provider")}, "passed": passed, "proof": proof, "evidence": evidence, "launch_config_sha256": (launch["config"] or {}).get("sha256")}
+        text = json.dumps(run, indent=1, ensure_ascii=False)
+        run_path = RUNS / f"{args.card}.{slug}.{at.strftime('%Y%m%dT%H%M%S')}.json"
+        run_path.write_text(text + "\n")
+    finally:
+        stop()  # the box is destroyed after the record is written: a destroy failure cannot lose a paid run
     proof["log"] = "sha256:" + hashlib.sha256(text.encode()).hexdigest()[:16]
     log(f"gates: {evidence['ok']}  decode {proof['tps']} tok/s, prefill {proof['prefill']} tok/s; evidence {run_path.relative_to(ROOT)}")
+    if failure is not None:
+        raise failure
     if not passed:
         log("FAILED: no recipe written")
         return 1
@@ -574,17 +619,26 @@ def cmd_convert(args):
         endpoint, where = args.endpoint.rstrip("/"), {"on": "owner", "gpu": args.gpu}
     else:
         endpoint, where, stop = rented(recipe, launch, args)
+    evidence, failure = {}, None
     try:
-        passed, proof, evidence = gates(endpoint, launch)
-    finally:
-        stop()
+        passed, proof, evidence = gates(endpoint, launch, evidence)
+    except BaseException as e:  # the run could not go on: the record is written anyway, and the error is not masked
+        passed, proof = False, {"gates": "", "tps": 0, "prefill": None, "served": None}
+        evidence.setdefault("ok", {})
+        evidence["error"] = repr(e)
+        failure = e
     at = dt.datetime.now(dt.timezone.utc)
     proof = {"at": at.strftime("%Y-%m-%d"), "on": where["on"], "gpu": where.get("gpu"), "launch_sha256": launch_hash(launch), **proof}
-    RUNS.mkdir(parents=True, exist_ok=True)
-    text = json.dumps({"recipe": recipe, "where": {k: v for k, v in where.items() if k not in ("handle", "provider")}, "passed": passed, "proof": proof, "evidence": evidence}, indent=1, ensure_ascii=False)
-    (RUNS / f"{args.card}.{f.stem}.{at.strftime('%Y%m%dT%H%M%S')}.json").write_text(text + "\n")
+    try:
+        RUNS.mkdir(parents=True, exist_ok=True)
+        text = json.dumps({"recipe": recipe, "where": {k: v for k, v in where.items() if k not in ("handle", "provider")}, "passed": passed, "proof": proof, "evidence": evidence}, indent=1, ensure_ascii=False)
+        (RUNS / f"{args.card}.{f.stem}.{at.strftime('%Y%m%dT%H%M%S')}.json").write_text(text + "\n")
+    finally:
+        stop()  # the box is destroyed after the record is written: a destroy failure cannot lose a paid run
     proof["log"] = "sha256:" + hashlib.sha256(text.encode()).hexdigest()[:16]
     log(f"gates: {evidence['ok']}  decode {proof['tps']} tok/s, prefill {proof['prefill']} tok/s")
+    if failure is not None:
+        raise failure
     if not passed:
         log("FAILED: the legacy recipe stays legacy")
         return 1
