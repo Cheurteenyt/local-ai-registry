@@ -7,6 +7,7 @@ all:
 	python3 lab/export_plugin.py
 
 check:
+	python3 -m unittest discover -s lab -p test_check_recipe.py
 	python3 -m unittest discover -s lab -p test_slotstream.py
 	python3 -m unittest discover -s lab -p test_export_plugin.py
 	python3 lab/lab.py check

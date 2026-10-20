@@ -641,10 +641,16 @@ def cmd_check(_):
     if gone:
         bad.append(f"registry/{KV_FLOOR_EXEMPT}: lists recipes that do not exist: {', '.join(gone)}")
     for f in sorted(RECIPES.rglob("*.json")):
-        r = json.loads(f.read_text())
         name = f.relative_to(ROOT)
         try:
+            r = json.loads(f.read_text())
+        except ValueError as e:
+            bad.append(f"{name}: not a JSON recipe ({e})")
+            continue
+        try:
             assert set(r) == {"model", "weights", "engine", "set", "card", "proof"}, f"fields {sorted(r)}"
+            assert isinstance(r["set"], dict), "set is not an object"
+            assert isinstance(r["proof"], list) and r["proof"], "the recipe has no proof"
             assert r["weights"] == "baked-into-image" or re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}", r["weights"]), "weights not pinned"
             c = card(r["card"])
             assert f.parent.name == r["card"] and f.parent.parent.name == c["vendor"], "path is not recipes/<vendor>/<card>/"
@@ -658,6 +664,8 @@ def cmd_check(_):
             if "companion" in launch:
                 check_companion(launch["companion"])
             p = r["proof"][0]
+            assert isinstance(p, dict), "the proof is not an object"
+            assert isinstance(p.get("gates"), str), "the proof's gates are not a string"
             if launch.get("resources") or "verifyArgs" in (launch.get("prepare") or {}):
                 check_execution(launch)
                 # a reported proof is its publisher's run, not an acceptance: there is no lab hash to bind
@@ -676,7 +684,8 @@ def cmd_check(_):
             else:
                 assert not low, (f"{kv_tokens(r, launch)} KV tokens on {setup_vram_gb(r, launch):g} GB: below the "
                                  f"{KV_FLOOR_TOKENS}-token floor for setups over {KV_FLOOR_ABOVE_VRAM_GB} GB")
-        except (AssertionError, KeyError, ValueError, SystemExit, FileNotFoundError) as e:
+        except (AssertionError, KeyError, ValueError, SystemExit, FileNotFoundError,
+                IndexError, TypeError, AttributeError) as e:
             bad.append(f"{name}: {e}")
     print("\n".join(bad) or f"recipes ok: {len(list(RECIPES.rglob('*.json')))}")
     return 1 if bad else 0
