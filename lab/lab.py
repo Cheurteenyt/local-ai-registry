@@ -430,8 +430,8 @@ def lab_spec(recipe, launch, args):
             self.env = {**(launch.get("env") or {}), **({"HF_TOKEN": tok.read_text().strip()} if tok.exists() else {})}
             self.vram_gb = card(recipe["card"])["vram_gb"] or 0
             self.gpu_override, self.hardware_id = args.proxy_gpu or args.gpu, recipe["card"]
-            if args.proxy_gpu:  # a twin card with more memory: search by its own size
-                self.vram_gb = args.proxy_vram
+            if args.proxy_gpu:  # a twin card: search by its own memory, the card's own
+                self.vram_gb = args.proxy_vram or card(recipe["card"])["vram_gb"]
             self.provision = []
             self.online = True
             if launch.get("config"):
@@ -493,6 +493,33 @@ def rented(recipe, launch, args):
     raise SystemExit("no host started the container")
 
 
+def proxy_memory(args, card_id):
+    """The memory a proxy card must have. Nothing caps a rented card's GPU memory, so a twin must have the card's
+    own memory: a bigger card would run the recipe on more memory than the recipe's card has."""
+    budget = card(card_id)["vram_gb"]
+    if getattr(args, "proxy_vram", None) not in (None, budget):
+        raise SystemExit(f"--proxy-vram {args.proxy_vram} GB: nothing caps a rented card's memory, so the proxy card "
+                         f"must have the card's {budget} GB")
+    return budget
+
+
+def proxy_proof(args, recipe, launch, evidence):
+    """The proof's `proxy` line: what the run really was, and whether the run may write a recipe. An owner's larger
+    machine standing in for the card: nothing caps its memory, so the proof states the measured peak against the
+    card's GPU budget, and a run over budget writes no recipe. A rented twin card: nothing caps the container's
+    memory either, so the twin has the card's own memory."""
+    sysctl = launch.get("sysctl") or {}
+    budget = sysctl["iogpu.wired_limit_mb"] / 1024 if "iogpu.wired_limit_mb" in sysctl else card(recipe["card"])["vram_gb"]
+    if args.on == "endpoint":
+        peak = evidence.get("context", {}).get("peak_gib")
+        note = f"{args.proxy_gpu}, not memory-capped; context-gate peak {peak} GiB of the card's {budget:g} GiB GPU budget"
+        if peak is None or peak > budget:
+            log(f"proxy run: peak {peak} GiB does not fit the card's {budget:g} GiB")
+            return note, False
+        return note, True
+    return f"{args.proxy_gpu}, not memory-capped; a twin of the card's {budget:g} GB, so the card's budget holds", True
+
+
 # ----------------------------------------------------------------------------- commands
 def cmd_try(args):
     if not re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}", args.weights):
@@ -519,6 +546,8 @@ def cmd_try(args):
     stop = lambda: None
     if launch.get("kind") == "host" and args.on != "endpoint":
         raise SystemExit(f"{p['id']} runs on the owner's machine, not a rented container: start it and use --on endpoint")
+    if args.proxy_gpu and args.on != "endpoint":
+        args.proxy_vram = proxy_memory(args, args.card)  # a rented twin has the card's own memory
     if args.on == "endpoint":
         endpoint, where = args.endpoint.rstrip("/"), {"on": "owner", "gpu": args.gpu}
     else:
@@ -529,18 +558,11 @@ def cmd_try(args):
         stop()
     at = dt.datetime.now(dt.timezone.utc)
     proof = {"at": at.strftime("%Y-%m-%d"), "on": where["on"], "gpu": where.get("gpu"), "launch_sha256": launch_hash(launch), **proof}
-    if args.proxy_gpu and args.on == "endpoint":
-        # an owner's larger machine standing in for this card: nothing caps its memory, so the proof states the
-        # measured peak against the card's GPU budget, and a run over budget writes no recipe
-        peak = evidence.get("context", {}).get("peak_gib")
-        sysctl = launch.get("sysctl") or {}
-        budget = sysctl["iogpu.wired_limit_mb"] / 1024 if "iogpu.wired_limit_mb" in sysctl else card(args.card)["vram_gb"]
-        proof["proxy"] = f"{args.proxy_gpu}, not memory-capped; context-gate peak {peak} GiB of the card's {budget:g} GiB GPU budget"
-        if peak is None or peak > budget:
-            passed = False
-            log(f"proxy run: peak {peak} GiB does not fit the card's {budget:g} GiB")
-    elif args.proxy_gpu:
-        proof["proxy"] = f"{args.proxy_gpu}, memory capped to the card"
+    if args.proxy_gpu:
+        # a twin card: the proof says what the run really was, and a run that does not fit the card writes no recipe
+        note, fits = proxy_proof(args, recipe, launch, evidence)
+        proof["proxy"] = note
+        passed = passed and fits
     slug = f"{args.model}.{p['id']}.{launch['ctx'] // 1024}k"
     RUNS.mkdir(parents=True, exist_ok=True)
     run = {"recipe": recipe, "where": {k: v for k, v in where.items() if k not in ("handle", "provider")}, "passed": passed, "proof": proof, "evidence": evidence, "launch_config_sha256": (launch["config"] or {}).get("sha256")}
@@ -570,6 +592,8 @@ def cmd_convert(args):
     recipe = json.loads(f.read_text())
     launch = render(recipe)
     stop = lambda: None
+    if args.proxy_gpu and args.on != "endpoint":
+        args.proxy_vram = proxy_memory(args, args.card)  # a rented twin has the card's own memory
     if args.on == "endpoint":
         endpoint, where = args.endpoint.rstrip("/"), {"on": "owner", "gpu": args.gpu}
     else:
@@ -580,6 +604,10 @@ def cmd_convert(args):
         stop()
     at = dt.datetime.now(dt.timezone.utc)
     proof = {"at": at.strftime("%Y-%m-%d"), "on": where["on"], "gpu": where.get("gpu"), "launch_sha256": launch_hash(launch), **proof}
+    if args.proxy_gpu:
+        note, fits = proxy_proof(args, recipe, launch, evidence)
+        proof["proxy"] = note
+        passed = passed and fits
     RUNS.mkdir(parents=True, exist_ok=True)
     text = json.dumps({"recipe": recipe, "where": {k: v for k, v in where.items() if k not in ("handle", "provider")}, "passed": passed, "proof": proof, "evidence": evidence}, indent=1, ensure_ascii=False)
     (RUNS / f"{args.card}.{f.stem}.{at.strftime('%Y%m%dT%H%M%S')}.json").write_text(text + "\n")
@@ -596,6 +624,10 @@ def cmd_convert(args):
 
 def cmd_proxy(args):
     """A card nobody rents takes its sibling's passing lab recipes, each proof marked proxy (same chip family, same memory)."""
+    sibling, target = card(args.sibling), card(args.card)
+    if sibling["vram_gb"] != target["vram_gb"]:  # the run was on the sibling: a card with less memory cannot hold it
+        raise SystemExit(f"{args.sibling} has {sibling['vram_gb']} GB and {args.card} has {target['vram_gb']} GB: "
+                         f"a sibling proxy must have the same memory")
     made = 0
     for f in sorted(RECIPES.glob(f"*/{args.sibling}/*.json")):
         r = json.loads(f.read_text())
@@ -665,6 +697,11 @@ def cmd_check(_):
                     assert p.get("launch_sha256") == launch_hash(launch), "typed launch changed since acceptance; rerun the recipe"
             if "withdrawn" in p:
                 assert p["withdrawn"] is True and p.get("src") and p.get("reason"), "withdrawal needs source and reason"
+            sibling = p.get("proxy") or ""
+            if re.fullmatch(r"[a-z0-9][a-z0-9-]*", sibling):  # a proxy proof naming the card the run was on
+                twin = card(sibling)
+                assert twin["vram_gb"] == c["vram_gb"], (f"proxy {sibling} has {twin['vram_gb']} GB and {r['card']} has "
+                                                        f"{c['vram_gb']} GB: a sibling proxy must have the same memory")
             need = set() if p.get("reported") or p.get("withdrawn") else {"load", "chat"} if p.get("legacy") else set(GATES)
             assert not r["proof"][0].get("reported") or r["proof"][0].get("src"), "a reported proof names its source"
             assert need <= set(r["proof"][0]["gates"].split()), "latest proof lacks a gate"
@@ -698,8 +735,8 @@ def main():
     t.add_argument("--on", default="vast", choices=["vast", "runpod", "endpoint"])
     t.add_argument("--endpoint")
     t.add_argument("--gpu", help="provider GPU name (default from the card) or, with --on endpoint, the GPU the owner ran it on")
-    t.add_argument("--proxy-gpu", help="run on this twin card, memory capped to the card's")
-    t.add_argument("--proxy-vram", type=int, default=16)
+    t.add_argument("--proxy-gpu", help="run on this twin card; nothing caps its memory, so a rented twin has the card's own")
+    t.add_argument("--proxy-vram", type=int, help="the proxy card's memory in GB (default: the card's own)")
     t.add_argument("--min-cuda", type=float)
     t.add_argument("--min-inet", type=int, default=500, help="vast: minimum host downlink, Mbps")
     t.add_argument("--max-price", type=float, default=1.5)
@@ -720,7 +757,7 @@ def main():
     cv.add_argument("--endpoint")
     cv.add_argument("--gpu")
     cv.add_argument("--proxy-gpu")
-    cv.add_argument("--proxy-vram", type=int, default=16)
+    cv.add_argument("--proxy-vram", type=int, help="the proxy card's memory in GB (default: the card's own)")
     cv.add_argument("--min-cuda", type=float)
     cv.add_argument("--min-inet", type=int, default=500, help="vast: minimum host downlink, Mbps")
     cv.add_argument("--max-price", type=float, default=2.0)
