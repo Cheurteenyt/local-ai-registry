@@ -21,6 +21,7 @@ import http.client
 import json
 import os
 import re
+import secrets
 import shlex
 import string
 import sys
@@ -339,12 +340,14 @@ def gates(endpoint, launch):
     c, u, _ = chat(endpoint, served, [{"role": "user", "content": "What is 17 * 23? Reply with only the number."}])
     thinking = c["message"].get("reasoning_content") or c["message"].get("reasoning") or ""
     content = c["message"].get("content") or ""
-    ok["reasoning"] = bool(thinking.strip()) and "391" in content and "<think>" not in content
+    # the answer must be the number itself: "3910" or "the 391st shipment" do not answer 17 x 23
+    numbers = {int(n) for n in re.findall(r"\b\d+\b", content)}
+    ok["reasoning"] = bool(thinking.strip()) and 391 in numbers and "<think>" not in content
     ev["reasoning"] = {"thinking_chars": len(thinking), "content": content[-200:]}
     # tools: a call with the right arguments, then the result used in the reply
     tool = {"type": "function", "function": {"name": "get_weather", "description": "Current weather for a city",
             "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}
-    msgs = [{"role": "user", "content": "What's the weather in Paris right now? Use the tool."}]
+    msgs = [{"role": "user", "content": "What's the weather in Paris right now? Use the tool and repeat the code it gives you."}]
     c, u, _ = chat(endpoint, served, msgs, tools=[tool])
     calls = c["message"].get("tool_calls") or []
     args = {}
@@ -353,16 +356,17 @@ def gates(endpoint, launch):
     except (ValueError, KeyError):
         pass
     first = bool(calls) and calls[0]["function"]["name"] == "get_weather" and "paris" in str(args.get("city", "")).lower()
-    reply, second = "", {}
+    reply, second, code = "", {}, ""
     if first:
+        code = secrets.token_hex(4)  # only a reply that used the tool result can carry the code in it
         msgs += [{"role": "assistant", "content": c["message"].get("content") or "", "tool_calls": calls},
-                 {"role": "tool", "tool_call_id": calls[0].get("id", "0"), "content": json.dumps({"city": "Paris", "temp_c": 17, "sky": "overcast"})}]
+                 {"role": "tool", "tool_call_id": calls[0].get("id", "0"), "content": json.dumps({"city": "Paris", "temp_c": 17, "sky": "overcast", "code": code})}]
         c2, _, _ = chat(endpoint, served, msgs, tools=[tool])
         reply = c2["message"].get("content") or ""
         second = {"finish": c2.get("finish_reason"), "calls_again": len(c2["message"].get("tool_calls") or []),
                   "thinking_chars": len(c2["message"].get("reasoning_content") or c2["message"].get("reasoning") or "")}
-    ok["tools"] = first and "17" in reply
-    ev["tools"] = {"call": calls[:1], "reply": reply[-200:], **second}
+    ok["tools"] = first and code in reply
+    ev["tools"] = {"call": calls[:1], "reply": reply[-200:], "code": code, **second}
     # context: a code planted near the end of a prompt that fills ~85% of the window
     target = int(launch["ctx"] * 0.85)
     filler = " ".join(f"Line {i}: the archive notes that shipment {i * 7 % 997} left dock {i % 13} on schedule." for i in range(target // 24))  # ~23.6 tokens a line (measured: 32,834 tokens from 1,473 lines)
