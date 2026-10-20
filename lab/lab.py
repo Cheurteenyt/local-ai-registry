@@ -320,9 +320,11 @@ def stream_rate(endpoint, model, prompt, window=30.0):
     whole = "".join(text)
     elapsed = time.monotonic() - (first or t0)
     sample, span = at_window or (whole, elapsed)
-    n, _ = count(endpoint, sample)
+    n, source = count(endpoint, sample)
     total, _ = count(endpoint, whole)
-    return (n / span if span else 0), total, time.monotonic() - t0
+    # the window the rate was measured over: the 30 s one when the answer outlasts it, the whole answer
+    # when it ends before it. The evidence has to name it, or a reader cannot check the rate from it.
+    return (n / span if span else 0), total, time.monotonic() - t0, n, round(span, 1), source
 
 
 def gates(endpoint, launch):
@@ -385,7 +387,9 @@ def gates(endpoint, launch):
         raise SystemExit("context gate: the connection dropped three times")
     got = u.get("prompt_tokens") or 0
     ok["context"] = "58213" in (c["message"].get("content") or "") and got >= launch["ctx"] * 0.6
-    ev["context"] = {"prompt_tokens": got, "seconds": round(secs, 1), "content": (c["message"].get("content") or "")[-80:]}
+    # the whole answer, not its last 80 characters: a model that answers in a sentence puts the code in the
+    # middle of it, and a reader who cannot see the code in the record cannot tell a retrieval from a guess
+    ev["context"] = {"prompt_tokens": got, "seconds": round(secs, 1), "content": c["message"].get("content") or ""}
     if dropped:  # the number came from a retry: say which attempt answered and how long the dropped attempt ran
         ev["context"]["retried"] = attempt
         ev["context"]["dropped_s"] = dropped
@@ -393,9 +397,12 @@ def gates(endpoint, launch):
         ev["context"]["peak_gib"] = round(u["peak_memory_gb"] * 1e9 / 2**30, 2)
     # speed: decode at concurrency 1, measured over the first 30 s of a streamed answer; the answer still runs
     # to its natural end (never capped), and its full length is kept as evidence
-    tps, total, secs = stream_rate(endpoint, served, "Write a detailed 600-word story about a lighthouse keeper.")
-    ok["speed"] = tps >= MIN_TPS
-    ev["speed"] = {"window_s": 30, "tokens_total": total, "seconds_total": round(secs, 1)}
+    tps, total, secs, n, span, source = stream_rate(endpoint, served, "Write a detailed 600-word story about a lighthouse keeper.")
+    # a rate counted by characters is not a measurement: the gate needs the server's own tokenizer, and the
+    # evidence says which of the two it used, so a reader can tell a measured rate from an estimated one
+    ok["speed"] = tps >= MIN_TPS and source == "tokenizer"
+    ev["speed"] = {"window_s": span, "tokens_in_window": n, "tokens_total": total, "seconds_total": round(secs, 1),
+                   "counted": source}
     # a retried answer comes from the server's prefix cache, so its seconds is not a prefill time: leave the
     # number out rather than publish a cached rate (the run can be repeated for a real prefill measurement)
     prefill = None if dropped else (round(got / ev["context"]["seconds"]) if got and ev["context"]["seconds"] else None)
